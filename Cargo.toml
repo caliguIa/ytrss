@@ -2,12 +2,14 @@
 name = "ytrss"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Quickly get RSS feed URLs from YouTube channel urls"
 
 [dependencies]
 clap = { version = "4.5.39", features = ["derive"] }
+futures = "0.3.31"
 reqwest = "0.12.18"
-tokio = { version = "1.45.1", features = ["full"] }
 select = "0.6.1"
 thiserror = "2.0.12"
+tokio = { version = "1.45.1", features = ["full"] }
 url = "2.5.4"
-futures = "0.3.31"
