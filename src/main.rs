@@ -206,8 +206,9 @@ impl Default for App {
 
 fn cli() -> Command {
     Command::new("ytrss")
-        .author(env!("CARGO_PKG_AUTHORS"))
         .version(env!("CARGO_PKG_VERSION"))
+        .subcommand_required(true)
+        .arg_required_else_help(true)
         .about("Extract RSS feeds from YouTube URLs")
         .subcommand(
             Command::new("url")
