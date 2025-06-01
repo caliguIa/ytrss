@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Arg, Command, value_parser};
 use futures::stream::{self, StreamExt};
 use select::document::Document;
 use select::predicate::Name;
@@ -204,57 +204,78 @@ impl Default for App {
     }
 }
 
-#[derive(Parser, Debug)]
-#[clap(author, version, about = "Extract RSS feeds from YouTube URLs")]
-struct Args {
-    /// A single YouTube URL to process
-    #[arg(short = 'u', long = "url", conflicts_with = "input_path")]
-    url: Option<String>,
-
-    /// Input file with YouTube URLs (one per line)
-    #[arg(short = 'f', long = "file", conflicts_with = "url")]
-    input_path: Option<std::path::PathBuf>,
-
-    /// Positional URL (alternative to --url)
-    #[arg(conflicts_with_all = ["url", "input_path"])]
-    url_positional: Option<String>,
-}
-impl Args {
-    fn get_url(&self) -> Option<&str> {
-        self.url.as_deref().or(self.url_positional.as_deref())
-    }
+fn cli() -> Command {
+    Command::new("ytrss")
+        .author(env!("CARGO_PKG_AUTHORS"))
+        .version(env!("CARGO_PKG_VERSION"))
+        .about("Extract RSS feeds from YouTube URLs")
+        .subcommand(
+            Command::new("url")
+                .about("Process a single YouTube URL")
+                .arg(
+                    Arg::new("yt_channel_url")
+                        .help("YouTube channel URL to extract RSS feed from")
+                        .value_name("YT_URL")
+                        .required(true)
+                        .index(1),
+                )
+                .arg_required_else_help(true),
+        )
+        .subcommand(
+            Command::new("file")
+                .about("Process a file containing YouTube URLs")
+                .arg(
+                    Arg::new("file_path")
+                        .help("Input file with YouTube channel URLs (one per line)")
+                        .value_name("FILE PATH")
+                        .required(true)
+                        .value_parser(value_parser!(std::path::PathBuf))
+                        .index(1),
+                ),
+        )
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let matches = cli().get_matches();
     let app = App::new();
 
-    if let Some(url) = args.get_url() {
-        let rss_url = app.run(url).await?;
-        Output::print(&rss_url);
-    } else if let Some(file_path) = args.input_path.as_ref() {
-        let results = app.run_file(file_path).await?;
+    match matches.subcommand() {
+        Some(("url", sub_matches)) => {
+            let rss_url = app
+                .run(
+                    sub_matches
+                        .get_one::<String>("yt_channel_url")
+                        .expect("required"),
+                )
+                .await?;
+            Output::print(&rss_url);
+        }
+        Some(("file", sub_matches)) => {
+            let file_path = sub_matches
+                .get_one::<std::path::PathBuf>("file_path")
+                .expect("required");
 
-        let successful_urls: Vec<_> = results
-            .iter()
-            .filter_map(|(_, result)| result.as_ref().ok().cloned())
-            .collect();
+            let results = app.run_file(file_path).await?;
 
-        for (url, result) in &results {
-            if let Err(e) = result {
-                eprintln!("Error processing {}: {}", url, e);
+            let successful_urls: Vec<_> = results
+                .iter()
+                .filter_map(|(_, result)| result.as_ref().ok().cloned())
+                .collect();
+
+            for (url, result) in &results {
+                if let Err(e) = result {
+                    eprintln!("Error processing {}: {}", url, e);
+                }
+            }
+
+            if successful_urls.is_empty() {
+                println!("No RSS feeds found.");
+            } else {
+                Output::write_urls(file_path, &successful_urls)?;
             }
         }
-
-        if successful_urls.is_empty() {
-            println!("No RSS feeds found.");
-        } else {
-            Output::write_urls(file_path, &successful_urls)?;
-        }
-    } else {
-        eprintln!("Error: Please provide either a YouTube URL or an input file path.");
-        std::process::exit(1);
+        _ => unreachable!(),
     }
 
     Ok(())
