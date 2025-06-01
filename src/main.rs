@@ -1,9 +1,13 @@
 use clap::Parser;
-use clap::error::Result;
+use futures::stream::{self, StreamExt};
 use select::document::Document;
 use select::predicate::Name;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
+use url::Url;
+
+const MAX_CONCURRENT_REQUESTS: usize = 10;
 
 #[derive(Error, Debug)]
 pub enum AppError {
@@ -18,42 +22,78 @@ pub enum AppError {
 
     #[error("URL error: {0}")]
     UrlError(String),
+
+    #[error("Invalid URL: {0}")]
+    InvalidUrl(#[from] url::ParseError),
 }
+
+type Result<T> = std::result::Result<T, AppError>;
 
 #[derive(Debug, Clone)]
 pub struct YoutubeUrl {
-    url: String,
+    url: Url,
 }
 impl YoutubeUrl {
-    pub fn new(url: &str) -> Result<Self, AppError> {
-        if !url.contains("youtube.com") && !url.contains("youtu.be") {
+    pub fn new(url_str: &str) -> Result<Self> {
+        let url = Url::parse(url_str)?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| AppError::UrlError("Missing host in URL".to_string()))?;
+
+        if !host.contains("youtube.com") && !host.contains("youtu.be") {
             return Err(AppError::UrlError("Not a YouTube URL".to_string()));
         }
-        Ok(Self {
-            url: url.to_string(),
-        })
+
+        Ok(Self { url })
     }
 
     pub fn as_str(&self) -> &str {
-        &self.url
+        self.url.as_str()
+    }
+}
+impl AsRef<str> for YoutubeUrl {
+    fn as_ref(&self) -> &str {
+        self.url.as_str()
     }
 }
 
-pub struct YoutubeClient;
+pub struct YoutubeClient {
+    client: reqwest::Client,
+}
 impl YoutubeClient {
-    pub async fn fetch_html(url: &YoutubeUrl) -> Result<String, AppError> {
-        let response = reqwest::get(url.as_str()).await?;
+    pub fn new() -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
+
+        Self { client }
+    }
+
+    pub async fn fetch_html(&self, url: &YoutubeUrl) -> Result<String> {
+        let response = self.client.get(url.as_str()).send().await?;
+
+        if !response.status().is_success() {
+            return Err(AppError::UrlError(format!(
+                "Failed to fetch URL: HTTP status {}",
+                response.status()
+            )));
+        }
+
         let html_content = response.text().await?;
         Ok(html_content)
+    }
+}
+impl Default for YoutubeClient {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 pub struct HTMLParser;
 impl HTMLParser {
-    /// Extract RSS feed URL from HTML content
-    pub fn extract_feed_url(html_content: &str) -> Result<String, AppError> {
+    pub fn extract_feed_url(html_content: &str) -> Result<String> {
         let document = Document::from(html_content);
-
         document
             .find(Name("link"))
             .find(|node| {
@@ -71,108 +111,158 @@ impl Output {
     pub fn print(url: &str) {
         println!("• {}", url);
     }
-    fn generate_output_filename(path: &Path) -> String {
-        path.file_name()
-            .and_then(|f| f.to_str())
-            .map(|name| {
-                if let Some(pos) = name.rfind('.') {
-                    let (base, ext) = name.split_at(pos);
-                    format!("{}_parsed{}", base, ext)
-                } else {
-                    format!("{}_parsed", name)
-                }
-            })
-            .unwrap_or_else(|| "output_parsed".to_string())
-    }
-    fn write_urls<W: std::io::Write>(writer: &mut W, urls: &[String]) -> std::io::Result<()> {
-        for url in urls {
-            writeln!(writer, "{}", url)?;
-        }
-        Ok(())
-    }
-    pub fn file(path: &Path, urls: Vec<String>) {
-        let new_file_name = Self::generate_output_filename(path);
-        let parent_dir = path.parent().unwrap_or_else(|| Path::new(""));
-        let new_path = parent_dir.join(new_file_name);
 
-        println!("Writing to: {}", new_path.display());
-        match std::fs::File::create(new_path) {
-            Ok(mut file) => {
-                if let Err(e) = Self::write_urls(&mut file, &urls) {
-                    eprintln!("Error writing to file: {}", e);
-                } else {
-                    println!("URLS successfully parsed");
-                }
-            }
-            Err(e) => eprintln!("Error creating file: {}", e),
+    pub fn generate_output_filename(path: &Path) -> PathBuf {
+        let file_stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("output");
+
+        let extension = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| format!(".{}", s))
+            .unwrap_or_default();
+
+        let parent_dir = path.parent().unwrap_or_else(|| Path::new(""));
+        parent_dir.join(format!("{}_parsed{}", file_stem, extension))
+    }
+
+    pub fn write_urls(path: &Path, urls: &[String]) -> Result<()> {
+        let output_path = Self::generate_output_filename(path);
+        println!("Writing to: {}", output_path.display());
+        use std::io::Write;
+
+        let mut file = std::fs::File::create(&output_path)?;
+        for url in urls {
+            writeln!(file, "{}", url)?;
         }
+
+        println!("URLs successfully written to file");
+        Ok(())
     }
 }
 
-pub struct App;
+pub struct App {
+    client: Arc<YoutubeClient>,
+}
 impl App {
-    pub async fn run(url: &str) -> Result<String, AppError> {
-        let youtube_url = YoutubeUrl::new(url)?;
-        let html_content = YoutubeClient::fetch_html(&youtube_url).await?;
+    pub fn new() -> Self {
+        Self {
+            client: Arc::new(YoutubeClient::new()),
+        }
+    }
+
+    pub async fn run(&self, url_str: &str) -> Result<String> {
+        let youtube_url = YoutubeUrl::new(url_str)?;
+        let html_content = self.client.fetch_html(&youtube_url).await?;
         HTMLParser::extract_feed_url(&html_content)
     }
-    pub async fn run_file(file_path: &Path) -> Result<Vec<String>, AppError> {
+
+    pub async fn run_file(&self, file_path: &Path) -> Result<Vec<(String, Result<String>)>> {
         let content = std::fs::read_to_string(file_path)?;
-        let mut urls = Vec::new();
-        for line in content.lines() {
-            let line = line.trim();
-            if !line.is_empty() {
-                match Self::run(line).await {
-                    Ok(rss_url) => urls.push(rss_url),
-                    Err(e) => eprintln!("Error processing URL {}: {}", line, e),
+
+        let urls: Vec<_> = content
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if !line.is_empty() {
+                    Some(line.to_string())
+                } else {
+                    None
                 }
-            }
-        }
-        Ok(urls)
+            })
+            .collect();
+
+        let client = Arc::clone(&self.client);
+
+        // Process URLs concurrently with limited parallelism
+        let results = stream::iter(urls)
+            .map(|url| {
+                let client = Arc::clone(&client);
+                async move {
+                    let result = async {
+                        let youtube_url = YoutubeUrl::new(&url)?;
+                        let html_content = client.fetch_html(&youtube_url).await?;
+                        HTMLParser::extract_feed_url(&html_content)
+                    }
+                    .await;
+
+                    (url, result)
+                }
+            })
+            .buffer_unordered(MAX_CONCURRENT_REQUESTS)
+            .collect::<Vec<_>>()
+            .await;
+
+        Ok(results)
+    }
+}
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[derive(Parser, Debug)]
-#[clap(author, version, about)]
+#[clap(author, version, about = "Extract RSS feeds from YouTube URLs")]
 struct Args {
+    /// A single YouTube URL to process
     #[arg(short = 'u', long = "url", conflicts_with = "input_path")]
     url: Option<String>,
-    #[arg(short = 'i', long = "input", conflicts_with = "url")]
+
+    /// Input file with YouTube URLs (one per line)
+    #[arg(short = 'f', long = "file", conflicts_with = "url")]
     input_path: Option<std::path::PathBuf>,
-    #[arg(short = 'o', long = "output", conflicts_with = "url")]
+
+    /// Positional URL (alternative to --url)
+    #[arg(conflicts_with_all = ["url", "input_path"])]
     url_positional: Option<String>,
 }
 impl Args {
-    fn get_url(&self) -> Option<String> {
-        self.url.clone().or(self.url_positional.clone())
+    fn get_url(&self) -> Option<&str> {
+        self.url.as_deref().or(self.url_positional.as_deref())
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), AppError> {
+async fn main() -> Result<()> {
     let args = Args::parse();
+    let app = App::new();
 
     if let Some(url) = args.get_url() {
-        let rss_url = App::run(&url).await?;
+        let rss_url = app.run(url).await?;
         Output::print(&rss_url);
     } else if let Some(file_path) = args.input_path.as_ref() {
-        let rss_urls = App::run_file(file_path).await?;
-        if rss_urls.is_empty() {
+        let results = app.run_file(file_path).await?;
+
+        let successful_urls: Vec<_> = results
+            .iter()
+            .filter_map(|(_, result)| result.as_ref().ok().cloned())
+            .collect();
+
+        for (url, result) in &results {
+            if let Err(e) = result {
+                eprintln!("Error processing {}: {}", url, e);
+            }
+        }
+
+        if successful_urls.is_empty() {
             println!("No RSS feeds found.");
         } else {
-            Output::file(file_path, rss_urls);
+            Output::write_urls(file_path, &successful_urls)?;
         }
     } else {
         eprintln!("Error: Please provide either a YouTube URL or an input file path.");
         std::process::exit(1);
     }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn test_youtube_url_valid() {
@@ -215,58 +305,27 @@ mod tests {
     fn test_generate_output_filename_with_extension() {
         let path = PathBuf::from("/path/to/input.txt");
         let result = Output::generate_output_filename(&path);
-        assert_eq!(result, "input_parsed.txt");
+        assert_eq!(result, PathBuf::from("/path/to/input_parsed.txt"));
     }
 
     #[test]
     fn test_generate_output_filename_without_extension() {
         let path = PathBuf::from("/path/to/inputfile");
         let result = Output::generate_output_filename(&path);
-        assert_eq!(result, "inputfile_parsed");
+        assert_eq!(result, PathBuf::from("/path/to/inputfile_parsed"));
     }
 
     #[test]
     fn test_generate_output_filename_just_filename() {
         let path = PathBuf::from("data.csv");
         let result = Output::generate_output_filename(&path);
-        assert_eq!(result, "data_parsed.csv");
+        assert_eq!(result, PathBuf::from("data_parsed.csv"));
     }
 
     #[test]
     fn test_generate_output_filename_with_multiple_dots() {
         let path = PathBuf::from("archive.tar.gz");
         let result = Output::generate_output_filename(&path);
-        assert_eq!(result, "archive.tar_parsed.gz");
-    }
-
-    #[test]
-    fn test_write_urls_to_buffer() {
-        let urls = vec![
-            "https://www.youtube.com/feeds/videos.xml?channel_id=1234".to_string(),
-            "https://www.youtube.com/feeds/videos.xml?channel_id=5678".to_string(),
-        ];
-
-        let mut buffer = Vec::new();
-        let result = Output::write_urls(&mut buffer, &urls);
-
-        assert!(result.is_ok());
-
-        let content = String::from_utf8(buffer).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], urls[0]);
-        assert_eq!(lines[1], urls[1]);
-    }
-
-    #[test]
-    fn test_write_empty_urls_to_buffer() {
-        let urls: Vec<String> = vec![];
-
-        let mut buffer = Vec::new();
-        let result = Output::write_urls(&mut buffer, &urls);
-
-        assert!(result.is_ok());
-        assert_eq!(buffer.len(), 0, "Buffer should be empty");
+        assert_eq!(result, PathBuf::from("archive.tar_parsed.gz"));
     }
 }
