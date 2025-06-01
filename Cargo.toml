@@ -9,4 +9,3 @@ reqwest = "0.12.18"
 tokio = { version = "1.45.1", features = ["full"] }
 select = "0.6.1"
 thiserror = "2.0.12"
-ansi_term = "0.12.1"
