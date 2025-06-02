@@ -5,7 +5,7 @@ A CLI tool to extract RSS feed URLs from YouTube channel URLs.
 ## Installation
 
 ```bash
-cargo install --path .
+cargo install ytrss
 ```
 
 ## Usage
@@ -45,4 +45,3 @@ ytrss file channels.txt
 - Supports both youtube.com and youtu.be URLs
 - Concurrent processing for file input (up to 10 requests)
 - Automatic output file generation for batch processing
-
