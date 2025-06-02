@@ -30,6 +30,17 @@ pub enum AppError {
 type Result<T> = std::result::Result<T, AppError>;
 
 #[derive(Debug, Clone)]
+pub struct ChannelInfo {
+    pub name: String,
+    pub rss_url: String,
+}
+impl std::fmt::Display for ChannelInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} - {}", self.name, self.rss_url)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct YoutubeUrl {
     url: Url,
 }
@@ -92,9 +103,10 @@ impl Default for YoutubeClient {
 
 pub struct HTMLParser;
 impl HTMLParser {
-    pub fn extract_feed_url(html_content: &str) -> Result<String> {
+    pub fn extract_channel_info(html_content: &str) -> Result<ChannelInfo> {
         let document = Document::from(html_content);
-        document
+
+        let rss_url = document
             .find(Name("link"))
             .find(|node| {
                 node.attr("title") == Some("RSS")
@@ -102,14 +114,24 @@ impl HTMLParser {
             })
             .and_then(|node| node.attr("href"))
             .map(String::from)
-            .ok_or_else(|| AppError::RssNotFound("RSS feed URL not found".to_string()))
+            .ok_or_else(|| AppError::RssNotFound("RSS feed URL not found".to_string()))?;
+
+        // Extract channel name - try multiple sources
+        let name = document
+            .find(Name("meta"))
+            .find(|node| node.attr("property") == Some("og:title"))
+            .and_then(|node| node.attr("content"))
+            .map(String::from)
+            .unwrap_or_else(|| "Unknown Channel".to_string());
+
+        Ok(ChannelInfo { name, rss_url })
     }
 }
 
 pub struct Output;
 impl Output {
-    pub fn print(url: &str) {
-        println!("• {}", url);
+    pub fn print(channel_info: &ChannelInfo) {
+        println!("• {}", channel_info);
     }
 
     pub fn generate_output_filename(path: &Path) -> PathBuf {
@@ -128,17 +150,18 @@ impl Output {
         parent_dir.join(format!("{}_parsed{}", file_stem, extension))
     }
 
-    pub fn write_urls(path: &Path, urls: &[String]) -> Result<()> {
+    pub fn write_channels(path: &Path, channels: &[ChannelInfo]) -> Result<()> {
         let output_path = Self::generate_output_filename(path);
         println!("Writing to: {}", output_path.display());
         use std::io::Write;
 
         let mut file = std::fs::File::create(&output_path)?;
-        for url in urls {
-            writeln!(file, "{}", url)?;
+        for channel in channels {
+            println!("{}", channel);
+            writeln!(file, "{}", channel)?;
         }
 
-        println!("URLs successfully written to file");
+        println!("Channels successfully written to file");
         Ok(())
     }
 }
@@ -153,13 +176,13 @@ impl App {
         }
     }
 
-    pub async fn run(&self, url_str: &str) -> Result<String> {
+    pub async fn run(&self, url_str: &str) -> Result<ChannelInfo> {
         let youtube_url = YoutubeUrl::new(url_str)?;
         let html_content = self.client.fetch_html(&youtube_url).await?;
-        HTMLParser::extract_feed_url(&html_content)
+        HTMLParser::extract_channel_info(&html_content)
     }
 
-    pub async fn run_file(&self, file_path: &Path) -> Result<Vec<(String, Result<String>)>> {
+    pub async fn run_file(&self, file_path: &Path) -> Result<Vec<(String, Result<ChannelInfo>)>> {
         let content = std::fs::read_to_string(file_path)?;
 
         let urls: Vec<_> = content
@@ -184,7 +207,7 @@ impl App {
                     let result = async {
                         let youtube_url = YoutubeUrl::new(&url)?;
                         let html_content = client.fetch_html(&youtube_url).await?;
-                        HTMLParser::extract_feed_url(&html_content)
+                        HTMLParser::extract_channel_info(&html_content)
                     }
                     .await;
 
@@ -243,14 +266,14 @@ async fn main() -> Result<()> {
 
     match matches.subcommand() {
         Some(("url", sub_matches)) => {
-            let rss_url = app
+            let channel_info = app
                 .run(
                     sub_matches
                         .get_one::<String>("yt_channel_url")
                         .expect("required"),
                 )
                 .await?;
-            Output::print(&rss_url);
+            Output::print(&channel_info);
         }
         Some(("file", sub_matches)) => {
             let file_path = sub_matches
@@ -259,7 +282,7 @@ async fn main() -> Result<()> {
 
             let results = app.run_file(file_path).await?;
 
-            let successful_urls: Vec<_> = results
+            let successful_channels: Vec<_> = results
                 .iter()
                 .filter_map(|(_, result)| result.as_ref().ok().cloned())
                 .collect();
@@ -270,10 +293,10 @@ async fn main() -> Result<()> {
                 }
             }
 
-            if successful_urls.is_empty() {
+            if successful_channels.is_empty() {
                 println!("No RSS feeds found.");
             } else {
-                Output::write_urls(file_path, &successful_urls)?;
+                Output::write_channels(file_path, &successful_channels)?;
             }
         }
         _ => unreachable!(),
@@ -299,28 +322,43 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_rss_feed_url() {
+    fn test_extract_channel_info() {
         let html = r#"
         <html>
             <head>
+                <meta property="og:title" content="Test Channel">
                 <link rel="alternate" type="application/rss+xml" title="RSS" href="https://www.youtube.com/feeds/videos.xml?channel_id=1234">
             </head>
         </html>
         "#;
 
-        let result = HTMLParser::extract_feed_url(html);
+        let result = HTMLParser::extract_channel_info(html);
         assert!(result.is_ok());
+        let channel_info = result.unwrap();
+        assert_eq!(channel_info.name, "Test Channel");
         assert_eq!(
-            result.unwrap(),
+            channel_info.rss_url,
             "https://www.youtube.com/feeds/videos.xml?channel_id=1234"
         );
     }
 
     #[test]
-    fn test_extract_rss_feed_url_not_found() {
+    fn test_extract_channel_info_not_found() {
         let html = "<html><head></head></html>";
-        let result = HTMLParser::extract_feed_url(html);
+        let result = HTMLParser::extract_channel_info(html);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_channel_info_display() {
+        let channel_info = ChannelInfo {
+            name: "Test Channel".to_string(),
+            rss_url: "https://example.com/rss".to_string(),
+        };
+        assert_eq!(
+            format!("{}", channel_info),
+            "Test Channel - https://example.com/rss"
+        );
     }
 
     #[test]
